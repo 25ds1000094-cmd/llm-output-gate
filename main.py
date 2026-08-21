@@ -323,30 +323,25 @@ def check_channel(channel: str, value: str):
 @app.post("/sanitize-output")
 async def sanitize_output(request: Request):
 
-    # Read the raw body.
     raw = await request.body()
 
-    # Invalid JSON must still produce the required JSON response.
     try:
         body = json.loads(raw.decode("utf-8"))
     except Exception:
         return respond(False, "INVALID_SCHEMA")
 
-    # Rule 1
     if not valid_schema(body):
         return respond(False, "INVALID_SCHEMA")
 
     channel = body["channel"]
     output = body["output"]
 
-    # Rule 2
     decoded = decode_once(output)
 
     if decoded != output:
         if check_channel(channel, decoded) is not None:
             return respond(False, "ENCODED_PAYLOAD")
 
-    # Rule 3
     reason = check_channel(channel, output)
 
     if reason is not None:
@@ -356,7 +351,7 @@ async def sanitize_output(request: Request):
 
 
 # ============================================================
-# Health endpoint
+# Health / deployment diagnostic endpoints
 # ============================================================
 
 @app.get("/health")
@@ -372,6 +367,17 @@ async def root():
     return JSONResponse(
         status_code=200,
         content={"status": "ok"},
+    )
+
+
+@app.get("/version")
+async def version():
+    return JSONResponse(
+        status_code=200,
+        content={
+            "service": "llm-output-gate",
+            "version": "2",
+        },
     )
 
 
