@@ -1,17 +1,14 @@
-import html
+import json
+import os
 import re
 from typing import Any
-from urllib.parse import urlparse, unquote
+from urllib.parse import unquote, urlparse
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 
-app = FastAPI(
-    title="LLM Output Handling Gate",
-    description="Deterministic OWASP LLM05 output security gate",
-    version="1.0.0",
-)
+app = FastAPI()
 
 
 ALLOWED_HOSTS = {
@@ -28,164 +25,193 @@ VALID_CHANNELS = {
 }
 
 
-# ---------------------------------------------------------
-# Helper: create the required response
-# ---------------------------------------------------------
+# ============================================================
+# Response helper
+# ============================================================
 
-def result(safe: bool, reason: str) -> dict:
+def make_result(safe: bool, reason: str):
     return {
         "safe": safe,
         "reason": reason,
     }
 
 
-# ---------------------------------------------------------
-# Rule 1: schema validation
-# ---------------------------------------------------------
+def reject(reason: str):
+    return JSONResponse(
+        content=make_result(False, reason),
+        status_code=200,
+    )
 
-def validate_schema(body: Any):
+
+def accept():
+    return JSONResponse(
+        content=make_result(True, "SAFE"),
+        status_code=200,
+    )
+
+
+# ============================================================
+# 1. INVALID_SCHEMA
+# ============================================================
+
+def valid_schema(body: Any) -> bool:
     if not isinstance(body, dict):
         return False
 
-    channel = body.get("channel")
-    output = body.get("output")
-
-    if channel not in VALID_CHANNELS:
+    if body.get("channel") not in VALID_CHANNELS:
         return False
 
-    if not isinstance(output, str):
+    if not isinstance(body.get("output"), str):
         return False
 
-    if len(output) > 20000:
+    if len(body["output"]) > 20000:
         return False
 
     return True
 
 
-# ---------------------------------------------------------
-# Rule 2: decode once
+# ============================================================
+# 2. Decode ONCE
 #
-# Required order:
-#   1. Percent escapes
-#   2. HTML entities
-#   3. \uXXXX escapes
-# ---------------------------------------------------------
+# Order:
+#   percent escapes
+#   exact HTML entities
+#   \uXXXX
+# ============================================================
+
+EXACT_HTML_ENTITIES = {
+    "&lt;": "<",
+    "&gt;": ">",
+    "&quot;": '"',
+    "&apos;": "'",
+    "&amp;": "&",
+}
+
+
+NUMERIC_ENTITY_RE = re.compile(
+    r"&#([0-9]+);|&#x([0-9a-fA-F]+);",
+    re.IGNORECASE,
+)
+
 
 UNICODE_ESCAPE_RE = re.compile(
     r"\\u([0-9a-fA-F]{4})"
 )
 
 
+def decode_html_entities_exact(value: str) -> str:
+    # Decode ONLY the entities explicitly specified
+    # by the assignment.
+
+    for entity, replacement in EXACT_HTML_ENTITIES.items():
+        value = value.replace(entity, replacement)
+
+    def numeric_replace(match):
+        try:
+            if match.group(1) is not None:
+                number = int(match.group(1), 10)
+            else:
+                number = int(match.group(2), 16)
+
+            return chr(number)
+
+        except (ValueError, OverflowError):
+            return match.group(0)
+
+    return NUMERIC_ENTITY_RE.sub(
+        numeric_replace,
+        value,
+    )
+
+
 def decode_once(value: str) -> str:
-    # 1. Decode percent escapes.
+    # 1. Percent escapes
     decoded = unquote(value)
 
-    # 2. Decode the requested HTML entities.
-    #
-    # html.unescape also handles numeric entities and the
-    # named entities specified by the assignment.
-    decoded = html.unescape(decoded)
+    # 2. HTML entities
+    decoded = decode_html_entities_exact(decoded)
 
-    # 3. Decode \uXXXX escapes.
-    def replace_unicode(match):
-        codepoint = int(match.group(1), 16)
-        return chr(codepoint)
+    # 3. Unicode escapes
+    def unicode_replace(match):
+        return chr(int(match.group(1), 16))
 
     decoded = UNICODE_ESCAPE_RE.sub(
-        replace_unicode,
+        unicode_replace,
         decoded,
     )
 
     return decoded
 
 
-# ---------------------------------------------------------
-# URL helpers
-# ---------------------------------------------------------
+# ============================================================
+# URL handling
+# ============================================================
 
 DANGEROUS_SCHEME_RE = re.compile(
     r"(?i)(?:javascript|data|vbscript)\s*:"
 )
 
 
-def has_dangerous_scheme_text(value: str) -> bool:
+def has_explicit_dangerous_scheme(value: str) -> bool:
     return bool(DANGEROUS_SCHEME_RE.search(value))
 
 
-def parse_url_for_check(value: str):
-    """
-    Parse a URL.
-
-    Protocol-relative URLs such as:
-        //attacker.example/path
-
-    are treated as HTTPS, as required by the assignment.
-    """
-
+def parse_url(value: str):
     value = value.strip()
 
+    # Protocol-relative URL counts as HTTPS.
     if value.startswith("//"):
         return urlparse("https:" + value)
 
     return urlparse(value)
 
 
-def is_absolute_url(value: str) -> bool:
-    parsed = parse_url_for_check(value)
-
-    # A protocol-relative URL counts as absolute.
-    if value.strip().startswith("//"):
-        return True
-
-    return bool(parsed.scheme)
-
-
-def url_has_dangerous_scheme(value: str) -> bool:
-    """
-    Returns True if:
-    - javascript:
-    - data:
-    - vbscript:
-    - or another non-http/https scheme
-    is present.
-    """
-
+def url_scheme_is_dangerous(value: str) -> bool:
     value = value.strip()
 
-    # Explicit dangerous schemes, allowing whitespace before ':'.
-    if has_dangerous_scheme_text(value):
+    # Explicit dangerous schemes.
+    if has_explicit_dangerous_scheme(value):
         return True
 
-    # Protocol-relative URLs are treated as HTTPS.
+    # Protocol-relative URL is treated as https.
     if value.startswith("//"):
         return False
 
     parsed = urlparse(value)
 
-    if parsed.scheme:
-        return parsed.scheme.lower() not in {
-            "http",
-            "https",
-        }
-
-    return False
-
-
-def external_host_is_disallowed(value: str) -> bool:
-    """
-    Check an absolute URL's parsed hostname.
-
-    Exact hostname matching is required.
-    """
-
-    value = value.strip()
-
-    if not is_absolute_url(value):
-        # Relative references are allowed.
+    # A URL with no scheme is relative.
+    if not parsed.scheme:
         return False
 
-    parsed = parse_url_for_check(value)
+    # Only HTTP and HTTPS are allowed.
+    return parsed.scheme.lower() not in {
+        "http",
+        "https",
+    }
 
+
+def is_absolute_url(value: str) -> bool:
+    value = value.strip()
+
+    # Assignment explicitly says //host/path is absolute.
+    if value.startswith("//"):
+        return True
+
+    parsed = urlparse(value)
+
+    return bool(parsed.scheme)
+
+
+def has_external_host(value: str) -> bool:
+    value = value.strip()
+
+    # Relative URLs are allowed.
+    if not is_absolute_url(value):
+        return False
+
+    parsed = parse_url(value)
+
+    # If an absolute URL has no hostname, reject it.
     hostname = parsed.hostname
 
     if hostname is None:
@@ -193,22 +219,19 @@ def external_host_is_disallowed(value: str) -> bool:
 
     hostname = hostname.lower()
 
+    # EXACT hostname match.
     return hostname not in ALLOWED_HOSTS
 
 
-# ---------------------------------------------------------
+# ============================================================
 # URL extraction
-# ---------------------------------------------------------
+# ============================================================
 
-# HTML:
-# Extract values from quoted src="..." and href="..."
 HTML_URL_RE = re.compile(
     r"""(?is)\b(?:src|href)\s*=\s*(["'])(.*?)\1"""
 )
 
 
-# Markdown:
-# Extract target inside ](...)
 MARKDOWN_URL_RE = re.compile(
     r"""\]\(\s*(?:<([^>]+)>|([^\s)]+))\s*\)""",
     re.IGNORECASE,
@@ -216,10 +239,12 @@ MARKDOWN_URL_RE = re.compile(
 
 
 def extract_html_urls(value: str) -> list[str]:
-    return [
-        match.group(2)
-        for match in HTML_URL_RE.finditer(value)
-    ]
+    urls = []
+
+    for match in HTML_URL_RE.finditer(value):
+        urls.append(match.group(2))
+
+    return urls
 
 
 def extract_markdown_urls(value: str) -> list[str]:
@@ -228,27 +253,17 @@ def extract_markdown_urls(value: str) -> list[str]:
     for match in MARKDOWN_URL_RE.finditer(value):
         if match.group(1) is not None:
             urls.append(match.group(1))
-        else:
+        elif match.group(2) is not None:
             urls.append(match.group(2))
 
     return urls
 
 
-# ---------------------------------------------------------
-# Rule checks
-# ---------------------------------------------------------
+# ============================================================
+# HTML rules
+# ============================================================
 
-def check_script_tag(value: str) -> bool:
-    """
-    Detect opening:
-      <script
-      <iframe
-      <object
-      <embed
-
-    Case-insensitive.
-    """
-
+def html_has_script_tag(value: str) -> bool:
     pattern = re.compile(
         r"(?is)<\s*(?:script|iframe|object|embed)\b"
     )
@@ -256,119 +271,102 @@ def check_script_tag(value: str) -> bool:
     return bool(pattern.search(value))
 
 
-def check_event_handler(value: str) -> bool:
-    """
-    Detect HTML event-handler attributes such as:
-
-        onclick=
-        onerror=
-        onload=
-
-    The check looks for an attribute beginning with 'on'
-    followed by an attribute boundary and '='.
-    """
+def html_has_event_handler(value: str) -> bool:
+    # Detect an attribute beginning with "on", followed by
+    # one or more attribute-name characters, then "=".
+    #
+    # Examples:
+    # onclick=
+    # onerror=
+    # onload=
 
     pattern = re.compile(
-        r"""(?is)(?:^|[\s<])on[a-zA-Z0-9_-]*\s*="""
+        r"""(?is)(?:^|[\s<])on[a-zA-Z0-9_-]+\s*="""
     )
 
     return bool(pattern.search(value))
 
 
-# ---------------------------------------------------------
-# HTML channel
-# ---------------------------------------------------------
+# ============================================================
+# Channel checks
+# ============================================================
 
 def check_html(value: str):
     # 1. SCRIPT_TAG
-    if check_script_tag(value):
+    if html_has_script_tag(value):
         return "SCRIPT_TAG"
 
     # 2. EVENT_HANDLER
-    if check_event_handler(value):
+    if html_has_event_handler(value):
         return "EVENT_HANDLER"
 
-    # Extract URLs for the remaining checks.
     urls = extract_html_urls(value)
 
-    # DANGEROUS_SCHEME
-    if has_dangerous_scheme_text(value):
+    # 3. DANGEROUS_SCHEME
+    if has_explicit_dangerous_scheme(value):
         return "DANGEROUS_SCHEME"
 
     for url in urls:
-        if url_has_dangerous_scheme(url):
+        if url_scheme_is_dangerous(url):
             return "DANGEROUS_SCHEME"
 
-    # EXTERNAL_EXFIL
+    # 4. EXTERNAL_EXFIL
     for url in urls:
-        if external_host_is_disallowed(url):
+        if has_external_host(url):
             return "EXTERNAL_EXFIL"
 
     return None
 
-
-# ---------------------------------------------------------
-# Markdown channel
-# ---------------------------------------------------------
 
 def check_markdown(value: str):
     urls = extract_markdown_urls(value)
 
-    # DANGEROUS_SCHEME
-    if has_dangerous_scheme_text(value):
+    # 1. DANGEROUS_SCHEME
+    if has_explicit_dangerous_scheme(value):
         return "DANGEROUS_SCHEME"
 
     for url in urls:
-        if url_has_dangerous_scheme(url):
+        if url_scheme_is_dangerous(url):
             return "DANGEROUS_SCHEME"
 
-    # EXTERNAL_EXFIL
+    # 2. EXTERNAL_EXFIL
     for url in urls:
-        if external_host_is_disallowed(url):
+        if has_external_host(url):
             return "EXTERNAL_EXFIL"
 
     return None
 
 
-# ---------------------------------------------------------
-# URL channel
-# ---------------------------------------------------------
-
 def check_url(value: str):
-    # The entire trimmed output is the URL.
     url = value.strip()
 
-    # DANGEROUS_SCHEME
-    if url_has_dangerous_scheme(url):
+    # 1. DANGEROUS_SCHEME
+    if url_scheme_is_dangerous(url):
         return "DANGEROUS_SCHEME"
 
-    # EXTERNAL_EXFIL
-    if external_host_is_disallowed(url):
+    # 2. EXTERNAL_EXFIL
+    if has_external_host(url):
         return "EXTERNAL_EXFIL"
 
     return None
 
 
-# ---------------------------------------------------------
-# SQL channel
-# ---------------------------------------------------------
-
 def check_sql(value: str):
     lowered = value.lower()
 
-    # Single quote
+    # single quote
     if "'" in value:
         return "SQL_METACHAR"
 
-    # Double quote
+    # double quote
     if '"' in value:
         return "SQL_METACHAR"
 
-    # Semicolon
+    # semicolon
     if ";" in value:
         return "SQL_METACHAR"
 
-    # SQL comment
+    # SQL line comment
     if "--" in value:
         return "SQL_METACHAR"
 
@@ -376,7 +374,7 @@ def check_sql(value: str):
     if "/*" in value:
         return "SQL_METACHAR"
 
-    # Word "union"
+    # word "union"
     if re.search(r"\bunion\b", lowered):
         return "SQL_METACHAR"
 
@@ -387,12 +385,7 @@ def check_sql(value: str):
     return None
 
 
-# ---------------------------------------------------------
-# Shell channel
-# ---------------------------------------------------------
-
 def check_shell(value: str):
-    # Any of:
     # ; & | ` < >
     if re.search(r"[;&|`<>]", value):
         return "SHELL_METACHAR"
@@ -408,75 +401,74 @@ def check_shell(value: str):
     return None
 
 
-# ---------------------------------------------------------
-# Apply channel-specific rules
-# ---------------------------------------------------------
-
-def check_channel(channel: str, output: str):
+def check_channel(channel: str, value: str):
     if channel == "html":
-        return check_html(output)
+        return check_html(value)
 
     if channel == "markdown":
-        return check_markdown(output)
+        return check_markdown(value)
 
     if channel == "url":
-        return check_url(output)
+        return check_url(value)
 
     if channel == "sql":
-        return check_sql(output)
+        return check_sql(value)
 
     if channel == "shell":
-        return check_shell(output)
+        return check_shell(value)
 
     return "INVALID_SCHEMA"
 
 
-# ---------------------------------------------------------
+# ============================================================
 # Main endpoint
-# ---------------------------------------------------------
+# ============================================================
 
 @app.post("/sanitize-output")
 async def sanitize_output(request: Request):
-    # Read JSON body.
+
+    # Read raw request body first.
+    raw_body = await request.body()
+
+    # Parse JSON ourselves so malformed JSON is always handled
+    # as INVALID_SCHEMA rather than exposing FastAPI's default
+    # validation response.
     try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse(
-            result(False, "INVALID_SCHEMA")
-        )
+        body = json.loads(raw_body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return reject("INVALID_SCHEMA")
 
-    # -----------------------------------------------------
-    # Rule 1: INVALID_SCHEMA
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Rule 1
+    # --------------------------------------------------------
 
-    if not validate_schema(body):
-        return JSONResponse(
-            result(False, "INVALID_SCHEMA")
-        )
+    if not valid_schema(body):
+        return reject("INVALID_SCHEMA")
 
     channel = body["channel"]
     output = body["output"]
 
-    # -----------------------------------------------------
-    # Rule 2: ENCODED_PAYLOAD
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Rule 2
+    # Decode exactly once.
+    # --------------------------------------------------------
 
     decoded = decode_once(output)
 
     if decoded != output:
+
         decoded_reason = check_channel(
             channel,
             decoded,
         )
 
         if decoded_reason is not None:
-            return JSONResponse(
-                result(False, "ENCODED_PAYLOAD")
-            )
+            return reject("ENCODED_PAYLOAD")
 
-    # -----------------------------------------------------
-    # Rule 3: original output
-    # -----------------------------------------------------
+    # --------------------------------------------------------
+    # Rule 3
+    # Check ORIGINAL output.
+    # --------------------------------------------------------
 
     reason = check_channel(
         channel,
@@ -484,27 +476,37 @@ async def sanitize_output(request: Request):
     )
 
     if reason is not None:
-        return JSONResponse(
-            result(False, reason)
-        )
+        return reject(reason)
 
-    # -----------------------------------------------------
-    # Everything passed
-    # -----------------------------------------------------
-
-    return JSONResponse(
-        result(True, "SAFE")
-    )
+    return accept()
 
 
-# ---------------------------------------------------------
-# Health check
-# ---------------------------------------------------------
+# ============================================================
+# Health / availability
+# ============================================================
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok"
+    }
+
 
 @app.get("/")
-def root():
+async def root():
     return {
-        "service": "LLM Output Handling Gate",
-        "status": "running",
-        "endpoint": "POST /sanitize-output",
+        "status": "ok"
     }
+
+
+# Local development only.
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.environ.get("PORT", "10000"))
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+    )
